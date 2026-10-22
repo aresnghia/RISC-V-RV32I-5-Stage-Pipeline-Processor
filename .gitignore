@@ -1,0 +1,23 @@
+﻿# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# ModelSim / QuestaSim
+rtl_work/
+work/
+transcript
+vsim.wlf
+*.wlf
+modelsim.ini
+
+# Quartus build artifacts
+build/
+db/
+incremental_db/
+*.qws
+
+# OS files
+Thumbs.db
+.DS_Store
