@@ -16,17 +16,19 @@ module DMEM (
         end
     end
 
-    wire [31:0] offset_addr = Address - 32'h00400000;
+    // Cắt bit trực tiếp Address[13:2] (12-bit cho 4096 từ = 16KB)
+    // Tự động map 0x80000000 -> index 0 mà không tốn bộ trừ logic
+    wire [11:0] dmem_idx = Address[13:2];
 
     always @(posedge clock) begin
         if (MemWrite) begin
-            if(Write_Pos[0]) dmem[offset_addr[13:2]][7:0]   <= Write_Data[7:0];
-            if(Write_Pos[1]) dmem[offset_addr[13:2]][15:8]  <= Write_Data[15:8];
-            if(Write_Pos[2]) dmem[offset_addr[13:2]][23:16] <= Write_Data[23:16];
-            if(Write_Pos[3]) dmem[offset_addr[13:2]][31:24] <= Write_Data[31:24];
+            if(Write_Pos[0]) dmem[dmem_idx][7:0]   <= Write_Data[7:0];
+            if(Write_Pos[1]) dmem[dmem_idx][15:8]  <= Write_Data[15:8];
+            if(Write_Pos[2]) dmem[dmem_idx][23:16] <= Write_Data[23:16];
+            if(Write_Pos[3]) dmem[dmem_idx][31:24] <= Write_Data[31:24];
         end
     end
     
-    assign Read_Data = (MemRead) ? dmem[offset_addr[13:2]] : 32'h0;
+    assign Read_Data = (MemRead) ? dmem[dmem_idx] : 32'h0;
 
 endmodule

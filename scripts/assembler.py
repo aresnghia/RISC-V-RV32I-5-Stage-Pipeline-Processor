@@ -2,6 +2,7 @@
 import re
 import codecs
 from config import *
+from csr import parse_csr
 
 class RiscVAssembler:
     def __init__(self):
@@ -14,16 +15,25 @@ class RiscVAssembler:
         self.data_memory_content = {} #lưu dữ liệu arr
 
     def _reg_to_bin(self, reg_str):
-        reg_num = REGISTERS.get(reg_str.strip(), 0)
-        return format(reg_num, '05b')
+        """Đổi tên thanh ghi RISC-V sang 5 bit nhị phân.
+
+        Báo lỗi rõ ràng nếu tên thanh ghi không hợp lệ để dễ debug.
+        """
+        name = reg_str.strip().lower()
+        if name not in REGISTERS:
+            raise ValueError(f"Không biết thanh ghi '{reg_str}'")
+        return format(REGISTERS[name], '05b')
 
     def _imm_to_bin(self, imm_val, bits):
         if imm_val < 0: imm_val = (1 << bits) + imm_val
         return format(imm_val, f'0{bits}b')
 
     def _parse_memory_arg(self, arg):
-        match = re.match(r"(-?(?:0x)?[\da-fA-F]+)\((.+)\)", arg)
-        if match: return int(match.group(1), 0), match.group(2)
+        match = re.match(r"^(?:(-?(?:0x)?[\da-fA-F]+))?\((.+)\)$", arg.strip())
+        if match:
+            imm_str = match.group(1)
+            imm = int(imm_str, 0) if imm_str else 0
+            return imm, match.group(2).strip()
         raise ValueError(f"Sai định dạng bộ nhớ: {arg}")
 
     def _expand_pseudo(self, inst, args):
@@ -42,6 +52,14 @@ class RiscVAssembler:
             'bgez': ('bge', [args[0], 'zero', args[1]] if len(args) == 2 else args),
             'blez': ('bge', ['zero', args[0], args[1]] if len(args) == 2 else args),
             'bgtz': ('blt', ['zero', args[0], args[1]] if len(args) == 2 else args),
+            # Pseudo-instructions cho CSR
+            'csrr': ('csrrs', [args[0], args[1], 'zero'] if len(args) == 2 else args),
+            'csrw': ('csrrw', ['zero', args[0], args[1]] if len(args) == 2 else args),
+            'csrs': ('csrrs', ['zero', args[0], args[1]] if len(args) == 2 else args),
+            'csrc': ('csrrc', ['zero', args[0], args[1]] if len(args) == 2 else args),
+            'csrwi': ('csrrwi', ['zero', args[0], args[1]] if len(args) == 2 else args),
+            'csrsi': ('csrrsi', ['zero', args[0], args[1]] if len(args) == 2 else args),
+            'csrci': ('csrrci', ['zero', args[0], args[1]] if len(args) == 2 else args),
         }
         return pseudo_map.get(inst, (inst, args))
 
@@ -100,6 +118,134 @@ class RiscVAssembler:
         return f"{imm_bin[0]}{imm_bin[10:20]}{imm_bin[9]}{imm_bin[1:9]}{rd}1101111"
 
     def _encode_jalr(self, args):
+        """Mã hóa lệnh JALR (Jump And Link Register)."""
+        rd = self._reg_to_bin(args[0])
+        imm, rs1_str = self._parse_memory_arg(args[1])
+        rs1 = self._reg_to_bin(rs1_str)
+        imm_bin = self._imm_to_bin(imm, 12)
+        return f"{imm_bin}{rs1}000{rd}1100111"
+
+    def _encode_csr(self, inst, args):
+        """Mã hóa 6 lệnh CSR của extension Zicsr.
+
+        Tất cả đều có opcode cố định 1110011. Khác nhau chủ yếu ở funct3 
+        và việc toán hạng thứ 2 là rs1 hay zimm.
+        """
+        funct3_map = {
+            'csrrw': '001',
+            'csrrs': '010',
+            'csrrc': '011',
+            'csrrwi': '101',
+            'csrrsi': '110',
+            'csrrci': '111',
+        }
+        if inst.endswith('i'):
+            if len(args) != 3:
+                raise ValueError(f"{inst} cần 3 toán hạng: rd, csr, zimm")
+            rd = self._reg_to_bin(args[0])
+            csr = self._imm_to_bin(parse_csr(args[1]), 12)
+            zimm = int(args[2], 0)
+            if not (0 <= zimm <= 31):
+                raise ValueError(f"zimm của {inst} phải trong [0, 31]")
+            rs1_or_uimm = format(zimm, '05b')
+        else:
+            if len(args) != 3:
+                raise ValueError(f"{inst} cần 3 toán hạng: rd, csr, rs1")
+            rd = self._reg_to_bin(args[0])
+            csr = self._imm_to_bin(parse_csr(args[1]), 12)
+            rs1_or_uimm = self._reg_to_bin(args[2])
+        return f"{csr}{rs1_or_uimm}{funct3_map[inst]}{rd}1110011"
+
+    def _encode_system(self, inst, args):
+        """Hỗ trợ nhóm lệnh system (ecall, ebreak, mret, sret, wfi).
+
+        Các mã nhị phân được ghi trực tiếp để ISS decode dễ hơn.
+        """
+        if args:
+            raise ValueError(f"{inst} không nhận toán hạng")
+        system_map = {
+            'ecall':  '00000000000000000000000001110011',
+            'ebreak': '00000000000100000000000001110011',
+            'sret':   '00010000001000000000000001110011',
+            'wfi':    '00010000010100000000000001110011',
+            'mret':   '00110000001000000000000001110011',
+        }
+        return system_map[inst]
+
+    def _encode_hypervisor(self, inst, args):
+        """Mã hóa các chỉ thị Hypervisor: hfence.vvma, hfence.gvma, hlv.*, hsv.*."""
+        funct3, funct7 = HYPERVISOR_TYPE[inst]
+        if inst in ('hfence.vvma', 'hfence.gvma'):
+            rs1 = self._reg_to_bin(args[0]) if len(args) > 0 else '00000'
+            rs2 = self._reg_to_bin(args[1]) if len(args) > 1 else '00000'
+            rd = '00000'
+            return f"{funct7}{rs2}{rs1}{funct3}{rd}1110011"
+        elif inst.startswith('hlv.'):
+            rd = self._reg_to_bin(args[0])
+            if '(' in args[1]:
+                _, rs1_str = self._parse_memory_arg(args[1])
+                rs1 = self._reg_to_bin(rs1_str)
+            else:
+                rs1 = self._reg_to_bin(args[1])
+            rs2 = '00001' if inst in ('hlv.bu', 'hlv.hu') else '00000'
+            return f"{funct7}{rs2}{rs1}{funct3}{rd}1110011"
+        elif inst.startswith('hsv.'):
+            rs2 = self._reg_to_bin(args[0])
+            if '(' in args[1]:
+                _, rs1_str = self._parse_memory_arg(args[1])
+                rs1 = self._reg_to_bin(rs1_str)
+            else:
+                rs1 = self._reg_to_bin(args[1])
+            rd = '00000'
+            return f"{funct7}{rs2}{rs1}{funct3}{rd}1110011"
+        raise ValueError(f"Không hỗ trợ lệnh hypervisor: {inst}")
+
+    def _encode_la_li(self, inst, args, address):
+        """Xử lý pseudo-instructions la (load address) và li (load immediate).
+
+        - la: tách thành auipc + addi
+        - li: nếu immediate nhỏ thì addi, lớn thì lui + addi
+        """
+        rd = args[0]
+        if inst == 'la':
+            label = args[1]
+            if label in self.data_labels:
+                addr = self.data_labels[label]
+            elif label in self.labels:
+                addr = self.labels[label]
+            else:
+                raise ValueError(f"Không tìm thấy nhãn '{label}'")
+
+            offset = addr - address
+            upper_20 = ((offset + 0x800) >> 12) & 0xFFFFF
+            lower_12 = offset & 0xFFF
+            if lower_12 & 0x800:
+                lower_12 -= 0x1000
+
+            return [
+                self._encode_u('auipc', [rd, str(upper_20)]),
+                self._encode_i('addi', [rd, rd, str(lower_12)])
+            ]
+
+        addr = int(args[1], 0)
+        if -2048 <= addr <= 2047:
+            return [self._encode_i('addi', [rd, 'zero', str(addr)])]
+
+        lower_12 = addr & 0xFFF
+        upper_20 = (addr >> 12) & 0xFFFFF
+        if lower_12 & 0x800:
+            upper_20 = (upper_20 + 1) & 0xFFFFF
+            lower_12 -= 0x1000
+
+        if lower_12 == 0:
+            return [self._encode_u('lui', [rd, str(upper_20)])]
+
+        return [
+            self._encode_u('lui', [rd, str(upper_20)]),
+            self._encode_i('addi', [rd, rd, str(lower_12)])
+        ]
+
+    def _encode_jalr(self, args):
         rd = self._reg_to_bin(args[0])
         imm, rs1_str = self._parse_memory_arg(args[1])
         rs1 = self._reg_to_bin(rs1_str)
@@ -135,6 +281,9 @@ class RiscVAssembler:
                 upper_20 = (upper_20 + 1) & 0xFFFFF
                 lower_12 -= 0x1000
 
+            if lower_12 == 0:
+                return [self._encode_u('lui', [rd, str(upper_20)])]
+
             return [
                 self._encode_u('lui', [rd, str(upper_20)]),
                 self._encode_i('addi', [rd, rd, str(lower_12)])
@@ -150,10 +299,19 @@ class RiscVAssembler:
             if not line: continue
 
             if line.startswith('.'):
-                directive = line.split()[0]
+                parts_dir = line.split()
+                directive = parts_dir[0]
+                # Hỗ trợ chuẩn GNU assembler: .section .text / .section .data / .section .tohost
+                if directive == '.section' and len(parts_dir) >= 2:
+                    sec_name = parts_dir[1].split(',')[0].strip('\"\'')
+                    if sec_name in ('.text', 'text'):
+                        section = '.text'
+                    elif sec_name in ('.data', 'data', '.tohost', 'tohost'):
+                        section = '.data'
+                    continue
                 if directive == '.data': section = '.data'; continue
                 elif directive == '.text': section = '.text'; continue
-                elif directive == '.globl': continue
+                elif directive in {'.globl', '.global', '.option', '.align', '.balign'}: continue
 
             if ':' in line:
                 label, rest = line.split(':', 1)
@@ -161,14 +319,14 @@ class RiscVAssembler:
                 else: self.data_labels[label.strip()] = data_addr
                 line = rest.strip()
                 if not line: continue
-            #hàm này nè
+
             if section == '.data':
                 if line.startswith('.word'):
                     words_str = line[len('.word'):].strip()
                     for w in words_str.split(','):
                         w = w.strip()
                         if w:
-                            self.data_memory_content[data_addr] = int(w, 0) & 0xFFFFFFFF # lưu nè
+                            self.data_memory_content[data_addr] = int(w, 0) & 0xFFFFFFFF
                             data_addr += 4
                 continue
 
@@ -184,8 +342,14 @@ class RiscVAssembler:
                 elif inst == 'li':
                     try:
                         imm_val = int(parts[2], 0) if len(parts) > 2 else int(parts[1], 0)
-                        current_addr += 4 if -2048 <= imm_val <= 2047 else 8
-                    except:
+                        if -2048 <= imm_val <= 2047:
+                            current_addr += 4
+                        else:
+                            lower_12 = imm_val & 0xFFF
+                            if lower_12 & 0x800:
+                                lower_12 -= 0x1000
+                            current_addr += 4 if lower_12 == 0 else 8
+                    except Exception:
                         current_addr += 4
                 else:
                     current_addr += 4
@@ -207,6 +371,15 @@ class RiscVAssembler:
                 elif inst in U_TYPE: binaries.append(self._encode_u(inst, args))
                 elif inst == 'jal': binaries.append(self._encode_j(inst, args, address))
                 elif inst == 'jalr': binaries.append(self._encode_jalr(args))
+                # Hỗ trợ 6 lệnh CSR của extension Zicsr
+                elif inst in {'csrrw', 'csrrs', 'csrrc', 'csrrwi', 'csrrsi', 'csrrci'}:
+                    binaries.append(self._encode_csr(inst, args))
+                # Hỗ trợ lệnh system: ecall, ebreak, mret, sret, wfi
+                elif inst in {'ecall', 'ebreak', 'mret', 'sret', 'wfi'}:
+                    binaries.append(self._encode_system(inst, args))
+                # Hỗ trợ chỉ thị Hypervisor Extension (H-Extension)
+                elif inst in HYPERVISOR_TYPE:
+                    binaries.append(self._encode_hypervisor(inst, args))
                 elif inst in ['la', 'li']: binaries.extend(self._encode_la_li(inst, args, address))
                 else: binaries.append(f"ERROR: '{inst}' chưa hỗ trợ ({line})")
             except Exception as e:
@@ -223,7 +396,7 @@ class RiscVAssembler:
             for addr, val in self.data_memory_content.items():
                 f.write(f"0x{addr:08x} 0x{val:08x}\n")
     def export_dmem_for_verilog(self, filename):
-        DMEM_BASE = 0x00400000
+        DMEM_BASE = TEXT_SEGMENT_BASE  # 0x80000000
         DMEM_SIZE = 4096
         with open(filename, "w") as f:
             for i in range(DMEM_SIZE):

@@ -68,10 +68,10 @@ module tb_CPU();
         // Dump memory
         file = $fopen("mem.txt", "w");
         if (file) begin
-            // Dump vùng data (0x00401000+)
+            // Dump vùng data (0x80001000+)
             for (i = 32'h400; i < 4096; i = i + 1) begin
                 if (my_DMEM.dmem[i] != 32'h0) begin
-                    $fdisplay(file, "mem[0x%08h] 0x%08h", 32'h00400000 + i*4, my_DMEM.dmem[i]);
+                    $fdisplay(file, "mem[0x%08h] 0x%08h", 32'h80000000 + i*4, my_DMEM.dmem[i]);
                 end
             end
 
